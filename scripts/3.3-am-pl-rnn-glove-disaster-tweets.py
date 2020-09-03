@@ -201,8 +201,10 @@ if __name__ == '__main__':
     #                                     pretrained_embeddings=dm.pretrained_embeddings,
     #                                     learning_rate=args.learning_rate)
 
-    trainer = pl.Trainer.from_argparse_args(args, deterministic=True,
-                                            weights_summary='full')
+    trainer = pl.Trainer.from_argparse_args(args,
+                                            deterministic=True,
+                                            weights_summary='full',
+                                            early_stop_callback=True)
 
     trainer.configure_logger(pl.loggers.TensorBoardLogger('lightning_logs/',
                                                           name='disaster_tweets_rnn_glove'))
