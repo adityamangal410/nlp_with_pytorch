@@ -159,7 +159,8 @@ class DisasterTweetsClassifierCNNResidual(DisasterTweetsClassifierCNN):
 
 
 def predict_target(text, classifier, vectorizer, max_seq_length):
-    text_vector, _ = torch.tensor(vectorizer.vectorize(text, max_seq_length))
+    text_vector, _ = vectorizer.vectorize(text, max_seq_length)
+    text_vector = torch.tensor(text_vector)
     pred = torch.nn.functional.softmax(classifier(text_vector.unsqueeze(dim=0)), dim=1)
     probability, target = pred.max(dim=1)
 
@@ -212,23 +213,25 @@ if __name__ == '__main__':
 
     dm.setup('fit')
 
-    # model = DisasterTweetsClassifierCNN(num_channels=args.num_channels,
-    #                                     hidden_dim=args.hidden_dim,
-    #                                     num_classes=2,
-    #                                     dropout_p=args.dropout_p,
-    #                                     pretrained_embeddings=dm.pretrained_embeddings,
-    #                                     learning_rate=args.learning_rate)
+    model = DisasterTweetsClassifierCNN(num_channels=args.num_channels,
+                                        hidden_dim=args.hidden_dim,
+                                        num_classes=2,
+                                        dropout_p=args.dropout_p,
+                                        pretrained_embeddings=dm.pretrained_embeddings,
+                                        learning_rate=args.learning_rate)
 
-    model = DisasterTweetsClassifierCNNResidual(num_channels=args.num_channels,
-                                                hidden_dim=args.hidden_dim,
-                                                num_classes=2,
-                                                dropout_p=args.dropout_p,
-                                                pretrained_embeddings=dm.pretrained_embeddings,
-                                                learning_rate=args.learning_rate,
-                                                max_seq_length=dm.train_ds.get_max_seq_length())
+    # model = DisasterTweetsClassifierCNNResidual(num_channels=args.num_channels,
+    #                                             hidden_dim=args.hidden_dim,
+    #                                             num_classes=2,
+    #                                             dropout_p=args.dropout_p,
+    #                                             pretrained_embeddings=dm.pretrained_embeddings,
+    #                                             learning_rate=args.learning_rate,
+    #                                             max_seq_length=dm.train_ds.get_max_seq_length())
 
-    trainer = pl.Trainer.from_argparse_args(args, deterministic=True,
-                                            weights_summary='full')
+    trainer = pl.Trainer.from_argparse_args(args,
+                                            deterministic=True,
+                                            weights_summary='full',
+                                            early_stop_callback=True)
 
     trainer.configure_logger(pl.loggers.TensorBoardLogger('lightning_logs/',
                                                           name='disaster_tweets_cnn_glove'))
