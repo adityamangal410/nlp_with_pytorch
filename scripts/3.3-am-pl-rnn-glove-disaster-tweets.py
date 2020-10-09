@@ -13,10 +13,14 @@ from disaster_tweets_data_module import *
 class DisasterTweetsClassifierRNN(pl.LightningModule):
 
     def __init__(self, rnn_hidden_size, num_classes,
-                 dropout_p, pretrained_embeddings, learning_rate):
+                 dropout_p, pretrained_embeddings, learning_rate,
+                 num_layers, bidirectional, aggregate_hiddens, aggregation_func='max'):
         super().__init__()
 
-        self.save_hyperparameters('num_classes', 'dropout_p', 'learning_rate', 'rnn_hidden_size')
+        self.save_hyperparameters('num_classes', 'dropout_p', 'learning_rate',
+                                  'rnn_hidden_size', 'num_layers', 'bidirectional',
+                                  'aggregate_hiddens', 'aggregation_func'
+                                  )
 
         embedding_dim = pretrained_embeddings.size(1)
         num_embeddings = pretrained_embeddings.size(0)
@@ -26,32 +30,36 @@ class DisasterTweetsClassifierRNN(pl.LightningModule):
                                       padding_idx=0,
                                       _weight=pretrained_embeddings)
 
-        self.rnn = torch.nn.RNNCell(embedding_dim, rnn_hidden_size)
+        self.rnn = torch.nn.RNN(embedding_dim, rnn_hidden_size, num_layers=num_layers, bidirectional=bidirectional)
+        rnn_output_size = rnn_hidden_size
+        if bidirectional:
+            rnn_output_size = rnn_hidden_size * 2
         self._dropout_p = dropout_p
-        self.fc1 = torch.nn.Linear(rnn_hidden_size, rnn_hidden_size)
+        self.fc1 = torch.nn.Linear(rnn_output_size, rnn_hidden_size)
         self.fc2 = torch.nn.Linear(rnn_hidden_size, num_classes)
 
         self.loss = torch.nn.CrossEntropyLoss(reduction='none')
 
     def _initialize_hidden(self, batch_size):
-        return torch.zeros((batch_size, self.hparams.rnn_hidden_size))
+        if self.hparams.bidirectional:
+            return torch.zeros((self.hparams.num_layers * 2, batch_size, self.hparams.rnn_hidden_size)).to(self.device)
+        else:
+            return torch.zeros((self.hparams.num_layers, batch_size, self.hparams.rnn_hidden_size)).to(self.device)
 
     def forward(self, batch, batch_lengths):
         x_embedded = self.emb(batch)
         batch_size, seq_size, feat_size = x_embedded.size()
         x_embedded = x_embedded.permute(1, 0, 2)
 
-        hiddens = []
         initial_hidden = self._initialize_hidden(batch_size)
 
-        hidden_t = initial_hidden
-        for t in range(seq_size):
-            hidden_t = self.rnn(x_embedded[t], hidden_t)
-            hiddens.append(hidden_t)
+        hidden_all, _ = self.rnn(x_embedded, initial_hidden)
 
-        hiddens = torch.stack(hiddens).permute(1, 0, 2)
-
-        features = self.column_gather(hiddens, batch_lengths)
+        hidden_all = hidden_all.permute(1, 0, 2)
+        if self.hparams.aggregate_hiddens:
+            features = self.element_wise_aggregate(hidden_all, batch_lengths, self.hparams.aggregation_func)
+        else:
+            features = self.column_gather(hidden_all, batch_lengths)
 
         int1 = torch.nn.functional.relu(torch.nn.functional.dropout(self.fc1(features),
                                                                     p=self._dropout_p))
@@ -64,7 +72,18 @@ class DisasterTweetsClassifierRNN(pl.LightningModule):
 
         for batch_index, column_index in enumerate(batch_lengths):
             out.append(hiddens[batch_index, column_index])
-        return torch.stack(out)
+        return torch.stack(out).to(self.device)
+
+    def element_wise_aggregate(self, hiddens, batch_lengths, func='max'):
+        batch_lengths = batch_lengths.long().detach().cpu().numpy() - 1
+        out = []
+
+        for batch_index, column_index in enumerate(batch_lengths):
+            if func is 'max':
+                out.append(torch.max(hiddens[batch_index, :column_index], 0).values)
+            else:
+                out.append(torch.mean(hiddens[batch_index, :column_index], 0))
+        return torch.stack(out).to(self.device)
 
     def training_step(self, batch, batch_idx):
         y_pred = self(batch['x_data'], batch['x_length'])
@@ -104,17 +123,23 @@ class DisasterTweetsClassifierRNN(pl.LightningModule):
         parser.add_argument('--rnn_hidden_size', default=32, type=int)
         parser.add_argument('--dropout_p', default=0.7, type=float)
         parser.add_argument('--learning_rate', default=1e-5, type=float)
+        parser.add_argument('--num_layers', default=3, type=int)
+        parser.add_argument('--bidirectional', default=False, action='store_true')
+        parser.add_argument('--aggregate_hiddens', default=False, action='store_true')
+        parser.add_argument('--aggregation_func', default='max', type=str)
         return parser
 
 
 class DisasterTweetsClassifierGRU(DisasterTweetsClassifierRNN):
     def __init__(self, rnn_hidden_size, num_classes,
-                 dropout_p, pretrained_embeddings, learning_rate):
+                 dropout_p, pretrained_embeddings, learning_rate,
+                 num_layers, bidirectional, aggregate_hiddens, aggregation_func='max'):
         super().__init__(rnn_hidden_size, num_classes,
-                         dropout_p, pretrained_embeddings, learning_rate)
+                         dropout_p, pretrained_embeddings, learning_rate,
+                         num_layers, bidirectional, aggregate_hiddens, aggregation_func=aggregation_func)
 
         embedding_dim = pretrained_embeddings.size(1)
-        self.rnn = torch.nn.GRUCell(embedding_dim, rnn_hidden_size)
+        self.rnn = torch.nn.GRU(embedding_dim, rnn_hidden_size, num_layers=num_layers, bidirectional=bidirectional)
 
 
 class DisasterTweetsClassifierLSTM(DisasterTweetsClassifierRNN):
@@ -187,13 +212,22 @@ if __name__ == '__main__':
     #                                     num_classes=2,
     #                                     dropout_p=args.dropout_p,
     #                                     pretrained_embeddings=dm.pretrained_embeddings,
-    #                                     learning_rate=args.learning_rate)
+    #                                     learning_rate=args.learning_rate,
+    #                                     num_layers=args.num_layers,
+    #                                     bidirectional=args.bidirectional,
+    #                                     aggregate_hiddens=args.aggregate_hiddens,
+    #                                     aggregation_func=args.aggregation_func
+    #                                     )
 
     model = DisasterTweetsClassifierGRU(rnn_hidden_size=args.rnn_hidden_size,
                                         num_classes=2,
                                         dropout_p=args.dropout_p,
                                         pretrained_embeddings=dm.pretrained_embeddings,
-                                        learning_rate=args.learning_rate)
+                                        learning_rate=args.learning_rate,
+                                        num_layers=args.num_layers,
+                                        bidirectional=args.bidirectional,
+                                        aggregate_hiddens=args.aggregate_hiddens,
+                                        aggregation_func=args.aggregation_func)
 
     # model = DisasterTweetsClassifierLSTM(rnn_hidden_size=args.rnn_hidden_size,
     #                                     num_classes=2,
@@ -204,7 +238,7 @@ if __name__ == '__main__':
     trainer = pl.Trainer.from_argparse_args(args,
                                             deterministic=True,
                                             weights_summary='full',
-                                            early_stop_callback=True)
+                                            early_stop_callback=False)
 
     trainer.configure_logger(pl.loggers.TensorBoardLogger('lightning_logs/',
                                                           name='disaster_tweets_rnn_glove'))
