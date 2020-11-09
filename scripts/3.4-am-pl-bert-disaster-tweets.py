@@ -1,0 +1,187 @@
+from argparse import ArgumentParser
+
+import sh
+import torch.nn
+from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
+
+from disaster_tweets_data_module import *
+
+
+sh.rm('-r', '-f', 'lightning_logs/disaster_tweets_bert_glove')
+
+
+class DisasterTweetsClassifierBert(pl.LightningModule):
+
+    def __init__(self, rnn_hidden_size, num_classes,
+                 dropout_p, pretrained_embeddings, learning_rate,
+                 num_layers, bidirectional, aggregate_hiddens, aggregation_func='max'):
+        super().__init__()
+
+        self.save_hyperparameters('num_classes', 'dropout_p', 'learning_rate',
+                                  'rnn_hidden_size', 'num_layers', 'bidirectional',
+                                  'aggregate_hiddens', 'aggregation_func'
+                                  )
+
+        embedding_dim = pretrained_embeddings.size(1)
+        num_embeddings = pretrained_embeddings.size(0)
+
+        self.emb = torch.nn.Embedding(embedding_dim=embedding_dim,
+                                      num_embeddings=num_embeddings,
+                                      padding_idx=0,
+                                      _weight=pretrained_embeddings)
+
+        self.rnn = torch.nn.RNN(embedding_dim, rnn_hidden_size, num_layers=num_layers, bidirectional=bidirectional)
+        rnn_output_size = rnn_hidden_size
+        if bidirectional:
+            rnn_output_size = rnn_hidden_size * 2
+        self._dropout_p = dropout_p
+        self.fc1 = torch.nn.Linear(rnn_output_size, rnn_hidden_size)
+        self.fc2 = torch.nn.Linear(rnn_hidden_size, num_classes)
+
+        self.loss = torch.nn.CrossEntropyLoss(reduction='none')
+
+    def _initialize_hidden(self, batch_size):
+        if self.hparams.bidirectional:
+            return torch.zeros((self.hparams.num_layers * 2, batch_size, self.hparams.rnn_hidden_size)).to(self.device)
+        else:
+            return torch.zeros((self.hparams.num_layers, batch_size, self.hparams.rnn_hidden_size)).to(self.device)
+
+    def forward(self, batch, batch_lengths):
+        x_embedded = self.emb(batch)
+        batch_size, seq_size, feat_size = x_embedded.size()
+        x_embedded = x_embedded.permute(1, 0, 2)
+
+        initial_hidden = self._initialize_hidden(batch_size)
+
+        hidden_all, _ = self.rnn(x_embedded, initial_hidden)
+
+        hidden_all = hidden_all.permute(1, 0, 2)
+        if self.hparams.aggregate_hiddens:
+            features = self.element_wise_aggregate(hidden_all, batch_lengths, self.hparams.aggregation_func)
+        else:
+            features = self.column_gather(hidden_all, batch_lengths)
+
+        int1 = torch.nn.functional.relu(torch.nn.functional.dropout(self.fc1(features),
+                                                                    p=self._dropout_p))
+        output = self.fc2(torch.nn.functional.dropout(int1, p=self._dropout_p))
+        return output
+
+    def training_step(self, batch, batch_idx):
+        y_pred = self(batch['x_data'], batch['x_length'])
+        loss = self.loss(y_pred, batch['y_target']).mean()
+        return {'loss': loss, 'log': {'train_loss': loss}}
+
+    def validation_step(self, batch, batch_idx):
+        y_pred = self(batch['x_data'], batch['x_length'])
+        loss = self.loss(y_pred, batch['y_target'])
+        acc = (y_pred.argmax(-1) == batch['y_target']).float()
+        return {'loss': loss, 'acc': acc}
+
+    def validation_epoch_end(self, outputs):
+        loss = torch.cat([o['loss'] for o in outputs], 0).mean()
+        acc = torch.cat([o['acc'] for o in outputs], 0).mean()
+        out = {'val_loss': loss, 'val_acc': acc}
+        return {**out, 'log': out}
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+
+    def test_step(self, batch, batch_idx):
+        y_pred = self(batch['x_data'], batch['x_length'])
+        loss = self.loss(y_pred, batch['y_target'])
+        acc = (y_pred.argmax(-1) == batch['y_target']).float()
+        return {'loss': loss, 'acc': acc}
+
+    def test_epoch_end(self, outputs):
+        loss = torch.cat([o['loss'] for o in outputs], 0).mean()
+        acc = torch.cat([o['acc'] for o in outputs], 0).mean()
+        out = {'test_loss': loss, 'test_acc': acc}
+        return {**out, 'log': out}
+
+    @staticmethod
+    def add_model_specific_args(parent_parser):
+        parser = ArgumentParser(parents=[parent_parser], add_help=False)
+        parser.add_argument('--rnn_hidden_size', default=32, type=int)
+        parser.add_argument('--dropout_p', default=0.7, type=float)
+        parser.add_argument('--learning_rate', default=1e-5, type=float)
+        parser.add_argument('--num_layers', default=3, type=int)
+        parser.add_argument('--bidirectional', default=False, action='store_true')
+        parser.add_argument('--aggregate_hiddens', default=False, action='store_true')
+        parser.add_argument('--aggregation_func', default='max', type=str)
+        return parser
+
+
+def predict_target(text, classifier, vectorizer, max_seq_length):
+    text_vector, vec_length = vectorizer.vectorize(text, max_seq_length)
+    text_vector = torch.tensor(text_vector)
+    vec_length = torch.tensor(vec_length)
+    pred = torch.nn.functional.softmax(classifier(text_vector.unsqueeze(dim=0), vec_length.unsqueeze(dim=0)), dim=1)
+    probability, target = pred.max(dim=1)
+
+    return {'pred': target.item(), 'probability': probability.item()}
+
+
+def predict_on_dataset(classifier, ds):
+    classifier.eval()
+    df = pd.DataFrame(columns=["text", "target", "pred", "probability"])
+    for sample in iter(ds):
+        result = predict_target(sample['text'], classifier, ds.get_vectorizer(), ds.get_max_seq_length())
+        result['target'] = sample['y_target'].item()
+        result['text'] = sample['text']
+        df = df.append(result, ignore_index=True)
+    df.target = df.target.astype(np.int32)
+    df.pred = df.pred.astype(np.int32)
+
+    f1 = f1_score(df.target, df.pred)
+    acc = accuracy_score(df.target, df.pred)
+    roc_auc = roc_auc_score(df.target, df.probability)
+    print("Result metrics - \n Accuracy={} \n F1-Score={} \n ROC-AUC={}".format(acc, f1, roc_auc))
+    return df
+
+
+if __name__ == '__main__':
+    parser = ArgumentParser()
+    parser = pl.Trainer.add_argparse_args(parser)
+
+    parser.add_argument('--batch_size', default=8, type=int)
+    parser.add_argument('--num_workers', default=0, type=int)
+    parser.add_argument('--tweets_data_path',
+                        default='../data/processed/nlp_with_disaster_tweets/train_with_splits.csv',
+                        type=str)
+    parser.add_argument('--embeddings_path',
+                        default='/Users/amangal/Desktop/machine-learning/nlp_with_disaster_tweets/data/glove.twitter'
+                                '.27B/glove.twitter.27B.25d.txt',
+                        type=str)
+
+    parser = DisasterTweetsClassifierBert.add_model_specific_args(parser)
+
+    args = parser.parse_args()
+    print("Args: \n {}".format(args))
+
+    pl.seed_everything(42)
+
+    dm = DisasterTweetsDataModule(tweets_data_path=args.tweets_data_path,
+                                  embeddings_path=args.embeddings_path,
+                                  batch_size=args.batch_size,
+                                  num_workers=args.num_workers)
+
+    dm.setup('fit')
+
+    model = DisasterTweetsClassifierBert(rnn_hidden_size=args.rnn_hidden_size,
+                                        num_classes=2,
+                                        dropout_p=args.dropout_p,
+                                        pretrained_embeddings=dm.pretrained_embeddings,
+                                        learning_rate=args.learning_rate,
+                                        num_layers=args.num_layers,
+                                        bidirectional=args.bidirectional,
+                                        aggregate_hiddens=args.aggregate_hiddens,
+                                        aggregation_func=args.aggregation_func)
+
+    trainer = pl.Trainer.from_argparse_args(args,
+                                            deterministic=True,
+                                            weights_summary='full',
+                                            early_stop_callback=False)
+
+    trainer.configure_logger(pl.loggers.TensorBoardLogger('lightning_logs/',
+                                                          name='disaster_tweets_bert_glove'))
+    trainer.fit(model, dm)
